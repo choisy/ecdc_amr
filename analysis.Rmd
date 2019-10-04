@@ -8,6 +8,8 @@ output:
   pdf_document:
     toc: yes
 <!-- bibliography: references.bib -->
+editor_options: 
+  chunk_output_type: console
 ---
 
 <!--
@@ -42,11 +44,227 @@ knitr::knit_hooks$set(
     options(prompt = if (options$engine %in% c("sh", "bash")) "$ " else "> ")
   })
 
-knitr::opts_chunk$set(margin = TRUE, prompt = TRUE, comment = "",
-                      collapse = TRUE, cache = FALSE, autodep = TRUE,
-                      dev.args = list(pointsize = 11), fig.height = 3.5,
-                      fig.width = 4.24725, fig.retina = 2, fig.align = "center")
+knitr::opts_chunk$set(cache = FALSE, autodep = TRUE, message = FALSE,
+                      warning = FALSE, dev.args = list(pointsize = 11),
+                      fig.height = 3.5, fig.width = 4.24725, fig.retina = 2,
+                      fig.align = "center")
 
 options(width = 137)
 ```
 
+## Packages
+
+```{r}
+# dplyr, magrittr, tidyr
+```
+
+
+```{r}
+library(magrittr)
+```
+
+
+## Downloading the data from ECDC and loading into R
+
+From Liselotte Diaz Högberg (Liselotte.Diaz-Hogberg@ecdc.europa.eu), on
+2019-02-18:
+
+*EARS-Net data are available for public download through our Surveillance Atlas,
+[atlas.ecdc.europa.eu/public](https://atlas.ecdc.europa.eu/public) (choose
+Antimicrobial resistance). The atlas includes a data export option in the top
+right corner. This data are open for use as long as the source is acknowledged.
+As a researcher, you are also welcome to access EARS-Net data through a third
+party data access request. Please find more information here [ecdc.europa.eu/en/publications-data/european-surveillance-system-tessy](https://ecdc.europa.eu/en/publications-data/european-surveillance-system-tessy)
+and do not hesitate to contact me for further details and clarifications.*
+
+We select `All time periods`, `All regions`, `All indicators` that we export to
+the `ECDC_surveillance_data_Antimicrobial_resistance.csv` file on `2019-10-03`
+
+```{r}
+ecdc <- "ECDC_surveillance_data_Antimicrobial_resistance.csv" %>% 
+  read.csv() %>% 
+  dplyr::filter(Unit == "N") %>% 
+  dplyr::select(-HealthTopic, -Unit, -RegionCode, -TxtValue) %>% 
+  tidyr::separate(Population, c("bacteria", "test"), "\\|") %>% 
+  dplyr::filter(!grepl("Combined", test)) %>% 
+  dplyr::mutate_if(is.factor, as.character) %>% 
+  dplyr::mutate_at("NumValue", as.integer) %>% 
+  tidyr::pivot_wider(names_from = Indicator, values_from = NumValue) %>% 
+  dplyr::transmute(bacteria = bacteria,
+                   test     = test,
+                   year     = Time,
+                   country  = RegionName,
+                   N        = `Total tested isolates`,
+                   R        = `Resistant (R) isolates`,
+                   I        = `Non-susceptible (I and R) isolates` - R)
+```
+
+which gives:
+
+```{r}
+ecdc
+```
+
+where `N` is the total number of samples, `R` is the number of samples that are
+resistant and `I` is the number of samples for which the resistance level is
+intermediate.
+
+## Data exploration
+
+The ECDC data has data on `r length(unique(ecdc$bacteria))` bacteria:
+
+```{r}
+sort(unique(ecdc$bacteria))
+```
+
+in `r length(unique(ecdc$country))` countries:
+
+```{r}
+sort(unique(ecdc$country))
+```
+
+over `r diff(range(ecdc$year)) + 1` years from `r min(ecdc$year)` to
+`r max(ecdc$year)`
+
+The tests of susceptibility that are performed are the following for the
+different bacteria:
+
+```{r}
+with(ecdc, table(bacteria, test))
+```
+
+The number of biological tests performed in the countries naturally increases
+with time:
+
+```{r}
+with(ecdc, table(year, country))
+```
+
+
+## Visualizing trends in resistance
+
+A function that estimates proportion with confidence intervals:
+
+```{r}
+proportion <- function(x, n, ...) {
+  if (n < 1) return(rep(0, 3))
+  with(binom.test(x, n, ...), c(estimate, conf.int))
+}
+```
+
+Using this function to add proportion to all the data:
+
+```{r}
+(ecdc2 <- ecdc %>% 
+  dplyr::mutate(prop = purrr::map2(R, N, proportion)) %>% 
+  tidyr::unnest(prop) %>% 
+  dplyr::mutate(., names = rep_len(c("estimate", "lower", "upper"), nrow(.))) %>% 
+  tidyr::pivot_wider(names_from = names, values_from = prop))
+```
+
+Let's plot it:
+
+```{r}
+ecdc2 %>% 
+  dplyr::filter(bacteria == "Escherichia coli",
+                test     == "Third-generation cephalosporins",
+                country  == "Netherlands") %>% 
+  dplyr::arrange(year) %>% 
+  with({
+    plot(year, estimate, pch = 19, ylim = c(0, max(upper)), col = "red",
+         type = "o", lty = 2, xlab = NA, ylab = "proportion of resistance")
+    arrows(year, lower, year, upper, .05, 90, 3, col = "red")
+  })
+```
+
+Let's make a function of this pipeline:
+
+```{r}
+plot_resistance <- function(df, bug, drug, country, ylim = NULL) {
+  require(magrittr)
+  df %<>% dplyr::filter(bacteria == !! bug,
+                        test     == !! drug,
+                        country  == !! country)
+  if (is.null(ylim)) ylim <- c(0, max(df$upper))
+  df %>%
+    dplyr::arrange(year) %>% 
+    with({
+      plot(year, estimate, pch = 19, ylim = ylim, col = "red",
+           type = "o", lty = 2, xlab = NA, ylab = "proportion of resistance")
+      arrows(year, lower, year, upper, .05, 90, 3, col = "red")
+    })
+}
+```
+
+And include this function into another one that plot the resistance levels of a
+given bacteria and a given antimicriobial for all the countries:
+
+```{r}
+plot_resistances <- function(df, bug, drug, ylim = NULL) {
+  opar <- par(mfrow = c(10, 3), plt = c(.15, .99, .2, .9))
+  for (country in sort(unique(ecdc$country))) {
+    plot_resistance(df, bug, drug, country, ylim)
+    mtext(country)
+  }
+  par(opar)
+}
+```
+
+Let's use this function for a number of bacteria / drug combinations:
+
+### Third-generation cephalosporins resistance in *Escherichia coli*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
+plot_resistances(ecdc2, "Escherichia coli", "Third-generation cephalosporins")
+```
+
+The same, this time with the same scale on the $y$-axis:
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
+plot_resistances(ecdc2, "Escherichia coli", "Third-generation cephalosporins", c(0, .5))
+```
+
+### Third-generation cephalosporins resistance in *Klebsiella pneumoniae*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
+plot_resistances(ecdc2, "Klebsiella pneumoniae", "Third-generation cephalosporins", c(0, 1))
+```
+
+### Carbapenems resistance in *Klebsiella pneumoniae*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
+plot_resistances(ecdc2, "Klebsiella pneumoniae", "Carbapenems", c(0, 1))
+```
+
+### Carbapenems resistance in *Pseudomonas aeruginosa*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
+plot_resistances(ecdc2, "Pseudomonas aeruginosa", "Carbapenems", c(0, 1))
+```
+
+### Ceftazidime resistance in *Pseudomonas aeruginosa*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
+plot_resistances(ecdc2, "Pseudomonas aeruginosa", "Ceftazidime", c(0, 1))
+```
+
+### MRSA
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
+plot_resistances(ecdc2, "Staphylococcus aureus", "Meticillin (MRSA)", c(0, 1))
+```
+
+
+## Modeling changes in resistance levels
+
+A Poisson model:
+
+$$
+R_{y+1} \sim \mbox{Pois}\left(\left[R_y + \rho R_y \left(N_y - \frac{R_y}{N_y}\right)\right]\frac{N_{y + 1}}{N_y}\right)
+$$
+
+A binomial model:
+
+$$
+R_{y+1} \sim \mbox{Bin}\left(N_{y+1}, \frac{R_y}{N_y} + \rho R_y \left(1 - \frac{R_y}{N_y^2}\right)\right)
+$$
