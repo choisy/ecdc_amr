@@ -52,19 +52,58 @@ knitr::opts_chunk$set(cache = FALSE, autodep = TRUE, message = FALSE,
 options(width = 137)
 ```
 
-## Packages
+# Introduction (and take-home message)
+
+The aim of this study is to characterize changes in the prevalence of resistant
+bacteria in a way that allows comparisons across bacteria, drugs and countries.
+For that, we have to acknowledge that the additional number of resistant strains
+in a given year compared to the previous one depends on:
+
+1. the rate at which resistant strains spread (i.e. *fitness*) and
+2. the number of resistant strains.
+
+Indeed, a few resistant strains with a high spreading capacity can produce the
+just as many additional resistant strains as many resistant strains with a low
+spreading capacity. This implies that a proper comparisons of the dynamics of
+change of the number of resistant strains needs to account for the current
+number of resistant strains. Furthermore, because even bacterial populations
+cannot grow indefinitely in size, the expected number of new resistant strains
+also depend on
+
+3. the number of non-resistant strains.
+
+Indeed, for a given value of resistance *fitness* and a given number of
+resistant strains, the additional number of resistant strains produced is lower
+in a case where all the bacteria are already resistant than in case where a
+subtantial proportion of the bacteria are still non-resistant and can be
+"replaced" by resistant strains.
+
+From what precedes, the change in the proportion of resistant strains in drug
+sensitivity tests performed at two different points in time depends on
+
+1. the rate at which resistant strains spread (i.e. *fitness*) and
+2. the proportion of resistant strains.
+
+We here proposed a simple model that allows to estimate the rate $\rho$ from
+resistance proportion data.
+
+# Packages
+
+Installing the required packages:
 
 ```{r}
-# dplyr, magrittr, tidyr
+required <- c("dplyr", "magrittr", "purrr", "tidyr")
+to_install <- setdiff(required, row.names(installed.packages()))
+if (length(to_install)) install.packages(to_install)
 ```
 
+Loading `magrittr` for interactive use:
 
 ```{r}
 library(magrittr)
 ```
 
-
-## Downloading the data from ECDC and loading into R
+# Downloading the data from ECDC and loading into R
 
 From Liselotte Diaz Högberg (Liselotte.Diaz-Hogberg@ecdc.europa.eu), on
 2019-02-18:
@@ -109,7 +148,7 @@ where `N` is the total number of samples, `R` is the number of samples that are
 resistant and `I` is the number of samples for which the resistance level is
 intermediate.
 
-## Data exploration
+# Data overview
 
 The ECDC data has data on `r length(unique(ecdc$bacteria))` bacteria:
 
@@ -124,10 +163,8 @@ sort(unique(ecdc$country))
 ```
 
 over `r diff(range(ecdc$year)) + 1` years from `r min(ecdc$year)` to
-`r max(ecdc$year)`
-
-The tests of susceptibility that are performed are the following for the
-different bacteria:
+`r max(ecdc$year)`. The tests of susceptibility that are performed are the
+following for the different bacteria:
 
 ```{r}
 with(ecdc, table(bacteria, test))
@@ -140,19 +177,27 @@ with time:
 with(ecdc, table(year, country))
 ```
 
-
-## Visualizing trends in resistance
+# Visualizing trends in resistance
 
 A function that estimates proportion with confidence intervals:
 
 ```{r}
 proportion <- function(x, n, ...) {
-  if (n < 1) return(rep(0, 3))
+  if (n < 2) return(rep(NA, 3))
   with(binom.test(x, n, ...), c(estimate, conf.int))
 }
 ```
 
 Using this function to add proportion to all the data:
+
+```{r}
+(ecdc2 <- ecdc %>% 
+  dplyr::mutate(prop = purrr::map2(R, N, proportion)) %>% 
+  tidyr::unnest(prop) %>% 
+  dplyr::mutate(., names = rep_len(c("estimate", "lower", "upper"), nrow(.))) %>% 
+  tidyr::pivot_wider(names_from = names, values_from = prop))
+```
+
 
 ```{r}
 (ecdc2 <- ecdc %>% 
@@ -180,90 +225,269 @@ ecdc2 %>%
 Let's make a function of this pipeline:
 
 ```{r}
-plot_resistance <- function(df, bug, drug, country, ylim = NULL) {
+plot_resistance <- function(df, bug, drug, country, ylim = NULL, color = "#d95f02", ...) {
   require(magrittr)
   df %<>% dplyr::filter(bacteria == !! bug,
                         test     == !! drug,
                         country  == !! country)
-  if (is.null(ylim)) ylim <- c(0, max(df$upper))
+  if (is.null(ylim)) ylim <- c(0, max(df$upper, na.rm = TRUE))
   df %>%
     dplyr::arrange(year) %>% 
     with({
-      plot(year, estimate, pch = 19, ylim = ylim, col = "red",
-           type = "o", lty = 2, xlab = NA, ylab = "proportion of resistance")
-      arrows(year, lower, year, upper, .05, 90, 3, col = "red")
+      plot(year, estimate, pch = 19, ylim = ylim, col = color, type = "o",
+           lty = 2, axes = FALSE, ann = FALSE, ...)
+      arrows(year, lower, year, upper, .05, 90, 3, col = color)
     })
+  axis(1)
+  axis(2, col = color, col.axis = color)
+  title(ylab = "proportion of resistance", col.lab = color)
 }
 ```
 
-And include this function into another one that plot the resistance levels of a
+And include this function into another one that plots the resistance levels of a
 given bacteria and a given antimicriobial for all the countries:
 
 ```{r}
-plot_resistances <- function(df, bug, drug, ylim = NULL) {
+plot_resistances <- function(df, bug, drug, ylim = NULL, color = "#d95f02", ...) {
   opar <- par(mfrow = c(10, 3), plt = c(.15, .99, .2, .9))
   for (country in sort(unique(ecdc$country))) {
-    plot_resistance(df, bug, drug, country, ylim)
+    plot_resistance(df, bug, drug, country, ylim, color, ...)
     mtext(country)
   }
   par(opar)
 }
 ```
 
-Let's use this function for a number of bacteria / drug combinations:
+We'll use this function `plot_resistances()` at the end of this document, after
+having performed estimation.
 
-### Third-generation cephalosporins resistance in *Escherichia coli*
+# Modeling changes in resistance levels
 
-```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
-plot_resistances(ecdc2, "Escherichia coli", "Third-generation cephalosporins")
-```
+## A Poisson model
 
-The same, this time with the same scale on the $y$-axis:
-
-```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
-plot_resistances(ecdc2, "Escherichia coli", "Third-generation cephalosporins", c(0, .5))
-```
-
-### Third-generation cephalosporins resistance in *Klebsiella pneumoniae*
-
-```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
-plot_resistances(ecdc2, "Klebsiella pneumoniae", "Third-generation cephalosporins", c(0, 1))
-```
-
-### Carbapenems resistance in *Klebsiella pneumoniae*
-
-```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
-plot_resistances(ecdc2, "Klebsiella pneumoniae", "Carbapenems", c(0, 1))
-```
-
-### Carbapenems resistance in *Pseudomonas aeruginosa*
-
-```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
-plot_resistances(ecdc2, "Pseudomonas aeruginosa", "Carbapenems", c(0, 1))
-```
-
-### Ceftazidime resistance in *Pseudomonas aeruginosa*
-
-```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
-plot_resistances(ecdc2, "Pseudomonas aeruginosa", "Ceftazidime", c(0, 1))
-```
-
-### MRSA
-
-```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.75}
-plot_resistances(ecdc2, "Staphylococcus aureus", "Meticillin (MRSA)", c(0, 1))
-```
-
-
-## Modeling changes in resistance levels
-
-A Poisson model:
+Let's consider the following model between 2 successive years:
 
 $$
 R_{y+1} \sim \mbox{Pois}\left(\left[R_y + \rho R_y \left(N_y - \frac{R_y}{N_y}\right)\right]\frac{N_{y + 1}}{N_y}\right)
 $$
 
-A binomial model:
+Where $N_y$ and $N_{y + 1}$ are the sample sizes at years $y$ and $y+1$, and
+$R_y$ and $R_{y + 1}$ are the number of resistant samples at years $y$ and $y+1$.
+
+```{r}
+data <- ecdc %>% dplyr::filter(bacteria == "Escherichia coli",
+                       test     == "Third-generation cephalosporins",
+                       country  == "Netherlands") %>% 
+  dplyr::arrange(year) %>% 
+  dplyr::select(N, R) %>% 
+  head(2) %>% 
+  as.matrix()
+```
+
+The following function computes the $\lambda$ parameter of the Poisson
+distribution, as a funtion of the growth rate $\rho$ (`rho`) of the resistant
+strains compared to the susceptible strain (i.e. $\rho < 0$ means that the
+resistant strain spreads less than the susceptible strain, $\rho = 0$ means that
+the resistant and susceptible strains spread equally well and $\rho > 0$ means
+that the resistant strain spreads more than the susceptible strain), $N_0$
+(`N_0`) and $R_0$ (`R_0`) the number of samples and resistant samples at a given
+year, and $N_1$ (`N_1`) the number of samples the year after:
+
+```{r}
+lambda <- function(rho, R0, N0, N1) {
+  (R0 + rho * R0 * (N0 - R0 / N0)) * N1 / N0
+}
+```
+
+Let's try it:
+
+```{r}
+lambda(.005, 1, 977, 1446)
+```
+
+The following function uses the `lambda() ` function to compute the minus 
+log-likelihood of a given values of $\rho$, given the observed values $N_0$,
+$R_0$, $N_1$ and $R_1$:
+
+```{r}
+mll <- function(theta, data) {
+  -dpois(data[2, 2], lambda(theta, data[1, 2], data[1, 1], data[2, 1]), log = TRUE)
+}
+```
+
+Let's try it:
+
+```{r}
+unname(mll(.01, data))
+```
+
+The funtion `mll()` is used by the following function in order to estimate the
+value of $\rho$, together with its confidence interval:
+
+```{r}
+estimate <- function(data, mll, interval, alpha = .95) {
+  if (data[1, 2] < 1) return(rep(NA, 3))
+  if (data[2, 2] < 2) return(rep(NA, 3))
+  if (data[1, 1] < 2) return(rep(NA, 3))
+  opt <- function(...) optimise(..., tol = .Machine$double.eps)
+  mle <- opt(mll, interval, data)
+  c(mle$minimum,
+    opt(function(theta, data) abs(mll(theta, data) - mle$objective - qchisq(alpha, 1) / 2), c(interval[1], mle$minimum), data)$minimum,
+    opt(function(theta, data) abs(mll(theta, data) - mle$objective - qchisq(alpha, 1) / 2), c(mle$minimum, interval[2]), data)$minimum)
+}
+```
+
+Let's try it:
+
+```{r}
+(mle <- estimate(data, mll, c(-.1, .1)))
+```
+
+Let's illustrate the estimation on a figure:
+
+```{r}
+theta_val <- seq(.001, .01, le = 100)
+plot(theta_val, mll(theta_val, data), type = "l", xlab = "parameter value",
+     ylab = "minus log-likelihood", col = "blue")
+abline(v = mle, col = "green", lty = 2)
+abline(h = mll(mle, data), col = "green", lty = 2)
+```
+
+The following function chunks a 2-column data frame into a list of 2 x 2 data
+frames, sliding row-wise a window of 2 rows:
+
+```{r}
+chunk <- function(df) {
+  lapply(1:(nrow(df) - 1), function(x) as.matrix(df[x:(x + 1), ]))
+}
+```
+
+We can put this `chunk()` function together with the `estimate()` function into
+the following pipeline that estimates $\rho$ with confidence interval for all
+the years of a data frame:
+
+```{r}
+estimate_all <- function(data, mll, interval) {
+  require(magrittr)
+  data %<>% dplyr::arrange(year)
+  data %>% 
+    dplyr::select(N, R) %>% 
+    chunk() %>% 
+    lapply(estimate, mll, interval) %>% 
+    do.call(rbind, .) %>%
+    as.data.frame() %>% 
+    setNames(c("estimate", "lower", "upper")) %>% 
+    dplyr::mutate(year = data$year[-length(data$year)] + .5) %>% 
+    dplyr::select(year, dplyr::everything())
+}
+```
+
+Let's try it on the resistance to 3rd-generation cephalosporins in $E. coli$ in
+the Netherlands and then plot the results:
+
+```{r}
+ecdc %>% dplyr::filter(bacteria == "Escherichia coli",
+                       test     == "Third-generation cephalosporins",
+                       country  == "Netherlands") %>%
+  estimate_all(mll, c(-.1, .1)) %>% 
+  with({
+    plot(year, estimate, xlab = NA, ylab = "resistance fitness",
+         ylim = c(min(lower, na.rm = TRUE), max(upper, na.rm = TRUE)), col = "blue", pch = 19)
+    arrows(year, lower, year, upper, .05, 90, 3, col = "blue")
+    abline(h = 0, lty = 2)
+})
+```
+
+Let's put the above code into the following function:
+
+```{r}
+plot_fitness <- function(df, bug, drug, country, interval, color = "#7570b3") {
+  est <- df %>% dplyr::filter(bacteria == !! bug,
+                       test     == !! drug,
+                       country  == !! country) %>%
+    estimate_all(mll, interval)
+  if (all(is.na(est$estimate))) {
+    plot(NA, ann = F, axes = F, xlim = 0:1, ylim = 0:1)
+  } else {
+    with(est, {
+      plot(year, estimate, xlab = NA, xlim = range(df$year),
+           ylim = c(min(lower, na.rm = TRUE), max(upper, na.rm = TRUE)), col = color, pch = 19, type = "o",
+           lty = 2, axes = FALSE, ann = FALSE)
+      arrows(year, lower, year, upper, .05, 90, 3, col = color)
+    })
+    abline(h = 0, lty = 2)
+    axis(4, col = color, col.axis = color)
+    mtext("resistance fitness", 4, 1.5, cex = 2 / 3, col = color)
+  }
+}
+```
+
+Let's combine the value of resistance prevalence and estimated resistance
+fitness on the same figure:
+
+```{r}
+plot_resistance(ecdc2, "Escherichia coli", "Third-generation cephalosporins", "Netherlands")
+par(new = TRUE)
+plot_fitness(ecdc, "Escherichia coli", "Third-generation cephalosporins", "Netherlands", c(-.1, .1))
+```
+
+Let's include the above code in the following function:
+
+```{r}
+plot_res_fit <- function(df, bug, drug, ylim = NULL, interval = c(-.1, .1)) {
+  opar <- par(mfrow = c(10, 3), plt = c(.13, .88, .2, .9))
+  for (country in sort(unique(ecdc$country))) {
+    plot_resistance(df, bug, drug, country, ylim, xlim = c(2000, 2017))
+    par(new = TRUE)
+    plot_fitness(df, bug, drug, country, interval)
+    mtext(country)
+  }
+  par(opar)
+}
+```
+
+Let's now apply this function for a number of situations
+
+### Third-generation cephalosporins resistance in *Escherichia coli*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.7}
+plot_res_fit(ecdc2, "Escherichia coli", "Third-generation cephalosporins")
+```
+
+### Third-generation cephalosporins resistance in *Klebsiella pneumoniae*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.7}
+plot_res_fit(ecdc2, "Klebsiella pneumoniae", "Third-generation cephalosporins")
+```
+
+### Carbapenems resistance in *Klebsiella pneumoniae*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.7}
+plot_res_fit(ecdc2, "Klebsiella pneumoniae", "Carbapenems")
+```
+
+### Carbapenems resistance in *Pseudomonas aeruginosa*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.7}
+plot_res_fit(ecdc2, "Pseudomonas aeruginosa", "Carbapenems")
+```
+
+### Ceftazidime resistance in *Pseudomonas aeruginosa*
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.7}
+plot_res_fit(ecdc2, "Pseudomonas aeruginosa", "Ceftazidime")
+```
+
+### MRSA
+
+```{r fig.height = 10 * 3.5 / 1.75, fig.width = 3 * 4.24725 / 1.7}
+plot_res_fit(ecdc2, "Staphylococcus aureus", "Meticillin (MRSA)")
+```
+
+## A binomial model
+
+The following binomial model is expected to produce exactly the same results
+(to be checked):
 
 $$
 R_{y+1} \sim \mbox{Bin}\left(N_{y+1}, \frac{R_y}{N_y} + \rho R_y \left(1 - \frac{R_y}{N_y^2}\right)\right)
